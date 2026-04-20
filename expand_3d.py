@@ -657,12 +657,16 @@ def _ray_hits_any_bvh(origin, direction, tris, bvh, skip_idx=-1):
 
 def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
                      axis_vec, xyz_units, input_xyz,
-                     line_tangents=None, tangent_mode="inferred_line"):
+                     line_tangents=None, tangent_mode="inferred_line",
+                     tri_normals=None):
     """Show STL + ground points + per-point normal/tangent arrows + a world
     coordinate triad. In "inferred_line" mode it also draws the inferred
     path as a cyan polyline with a forward-tangent arrow per point. In
     "global_axis" mode it draws the GLOBAL_AXIS as a magenta dashed line
-    through the origin. Blocking: user closes the window to resume.
+    through the origin. STL faces are colored yellow when the outward
+    normal direction is consistent with a centroid-based outward check,
+    black when it's inverted — gives a visual audit of the STL winding
+    for closed bodies. Blocking: user closes the window to resume.
     Lazily imports matplotlib so it stays an optional dep."""
     try:
         import matplotlib.pyplot as plt
@@ -675,9 +679,30 @@ def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
     fig = plt.figure(figsize=(11, 9))
     ax = fig.add_subplot(111, projection="3d")
 
-    # STL mesh as semi-transparent surface.
+    # Per-face outward/inward check via centroid heuristic: for a closed
+    # body, an outward-facing normal aligns with the vector from the mesh
+    # centroid to the face center. Yellow = outward (correct); black =
+    # inverted. For flat or nearly-flat meshes all dots are ~0, so we
+    # default those to yellow (trust the stored normal).
+    n_tri = tris_user.shape[0]
+    face_colors = None
+    if tri_normals is not None and n_tri > 0 and tri_normals.shape[0] == n_tri:
+        centroid = tris_user.reshape(-1, 3).mean(axis=0)
+        tri_centers = tris_user.mean(axis=1)
+        ref = tri_centers - centroid
+        dots = np.einsum("ij,ij->i", tri_normals, ref)
+        max_abs_dot = float(np.max(np.abs(dots))) if dots.size else 0.0
+        tol_dot = 1e-6 * max_abs_dot  # treat ~0 dots as outward
+        outward_mask = dots >= -tol_dot
+        yellow = np.array([0.97, 0.82, 0.15, 0.45], dtype=float)
+        black  = np.array([0.07, 0.07, 0.07, 0.55], dtype=float)
+        face_colors = np.where(outward_mask[:, None], yellow, black)
+
+    # STL mesh as semi-transparent surface, colored per-face.
     poly = Poly3DCollection(
-        tris_user, facecolor=(0.72, 0.76, 0.85, 0.28),
+        tris_user,
+        facecolors=face_colors if face_colors is not None
+                    else (0.72, 0.76, 0.85, 0.28),
         edgecolor=(0.30, 0.33, 0.42, 0.55), linewidths=0.35,
     )
     ax.add_collection3d(poly)
@@ -763,9 +788,11 @@ def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
     ax.set_zlabel("Z ({})".format(xyz_units))
     overlay = ("cyan=line_tangent (path)" if tangent_mode == "inferred_line"
                else "magenta=GLOBAL_AXIS")
+    face_legend = (" | faces: yellow=outward  black=inverted"
+                   if face_colors is not None else "")
     ax.set_title(
         "STL + ground points    "
-        "red=normal  green=2D az=0° direction  {}".format(overlay)
+        "red=normal  green=2D az=0° direction  {}{}".format(overlay, face_legend)
     )
 
     # Equal aspect cube around all geometry + arrows.
@@ -979,6 +1006,7 @@ def _expand_stl_xyz(data_2d):
             [list(p) for p in XYZ_POINTS],
             line_tangents=line_tangents_raw,
             tangent_mode=mode_str,
+            tri_normals=tri_normals,
         )
 
     # Per-point amplitude weights (segment length × aperture window, or a
