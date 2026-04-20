@@ -127,6 +127,24 @@ CHECK_SHADOWING = True
 SHADOW_DB_FLOOR = -200.0      # dB floor applied when every point is shadowed
 COHERENT_SUM    = False       # False = power sum; True = amplitude sum with
                               # free-space phase per point path length
+
+# Per-point amplitude weight. Applied as `amp_i = w_i · √σ_2D · ...` (coherent)
+# or `σ_i · w_i²` (power). Two effects combined:
+#   (a) a Riemann-sum segment-length factor so the coherent magnitude is
+#       independent of sampling density along a line (each point represents
+#       a chunk of the feature of length ~Δyᵢ);
+#   (b) an optional aperture window to suppress end-fire / sidelobes.
+# Options:
+#   "uniform"  — every point gets w = 1 (legacy; magnitude scales with N).
+#   "segment"  — w_i = Δyᵢ only; uniform amplitude but density-invariant.
+#   "hann"     — w_i = Δyᵢ · Hann(i/(N−1)); ~32 dB sidelobe suppression.
+#   "hamming"  — w_i = Δyᵢ · Hamming(i/(N−1)); ~43 dB.
+#   "blackman" — w_i = Δyᵢ · Blackman(i/(N−1)); ~58 dB.
+#   list[float] — custom per-point weights (length must equal len(XYZ_POINTS)).
+# For a single point, the window factor is 1 and the segment length is 1
+# so the weight is just 1 regardless of mode — preserves legacy behavior
+# for isolated scatterers.
+POINT_WEIGHTS   = "hann"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -237,6 +255,66 @@ def _angle_between(v1, v2):
     c = float(np.dot(v1, v2))
     c = max(-1.0, min(1.0, c))
     return math.acos(c)
+
+
+def _build_point_weights(pts, spec):
+    """Return per-point amplitude weights from a spec string or explicit list.
+
+    Combines a segment-length (Riemann) factor with an optional aperture
+    window. Resulting weights have the interpretation that the coherent
+    broadside magnitude is (Σ wᵢ)·√σ_2D ≈ (L_effective)·√σ_2D, which is
+    independent of sampling density once Nyquist is satisfied.
+    """
+    n = int(pts.shape[0])
+    weights = np.ones(n, dtype=np.float64)
+
+    # Custom explicit list — no segment or window factor.
+    if isinstance(spec, (list, tuple, np.ndarray)):
+        arr = np.asarray(spec, dtype=np.float64)
+        if arr.shape[0] != n:
+            raise ValueError(
+                "POINT_WEIGHTS list length {} must match XYZ_POINTS length {}"
+                .format(arr.shape[0], n)
+            )
+        return arr
+
+    mode = str(spec).strip().lower()
+    if mode == "uniform":
+        return weights  # all ones, legacy behavior
+
+    if n < 2:
+        return weights  # nothing to taper over
+
+    # Segment length around each point (trapezoidal): half of the distance
+    # to the previous neighbor plus half to the next. Endpoints use the
+    # half-segment on the one side they have.
+    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)     # (n-1,)
+    seg = np.zeros(n, dtype=np.float64)
+    seg[0]       = 0.5 * diffs[0]
+    seg[-1]      = 0.5 * diffs[-1]
+    seg[1:-1]    = 0.5 * (diffs[:-1] + diffs[1:])
+
+    if mode == "segment":
+        return seg
+
+    # Aperture window, indexed by cumulative arc length so non-uniform
+    # spacing still gets a smooth taper.
+    s = np.concatenate(([0.0], np.cumsum(diffs)))             # (n,)
+    u = s / s[-1]                                             # 0..1
+
+    if mode == "hann":
+        win = 0.5 - 0.5 * np.cos(2.0 * np.pi * u)
+    elif mode == "hamming":
+        win = 0.54 - 0.46 * np.cos(2.0 * np.pi * u)
+    elif mode == "blackman":
+        win = (0.42 - 0.5 * np.cos(2.0 * np.pi * u)
+               + 0.08 * np.cos(4.0 * np.pi * u))
+    else:
+        raise ValueError(
+            "POINT_WEIGHTS must be 'uniform', 'segment', 'hann', 'hamming', "
+            "'blackman', or a list of floats; got {!r}".format(spec)
+        )
+    return seg * win
 
 
 def _infer_line_tangents(pts):
@@ -879,6 +957,25 @@ def _expand_stl_xyz(data_2d):
             tangent_mode=mode_str,
         )
 
+    # Per-point amplitude weights (segment length × aperture window, or a
+    # user-supplied list). `point_feet` is in metres; the segment-length
+    # factor inherits those units, so the effective aperture "length" shown
+    # in the summary is in metres too.
+    point_weights = _build_point_weights(point_feet, POINT_WEIGHTS)
+    if SNAP_VERBOSE:
+        w_sum = float(np.sum(point_weights))
+        w_max = float(np.max(point_weights))
+        w_min = float(np.min(point_weights))
+        print(
+            "  point weights: mode={!r}  N={}  sum(w)={:.4g}  "
+            "max={:.4g}  min={:.4g} (internal m units)".format(
+                POINT_WEIGHTS if isinstance(POINT_WEIGHTS, str)
+                else "custom list",
+                point_weights.size, w_sum, w_max, w_min,
+            ),
+            flush=True,
+        )
+
     # Build a BVH once for the whole shadow-ray workload.
     bvh = None
     if CHECK_SHADOWING:
@@ -977,16 +1074,22 @@ def _expand_stl_xyz(data_2d):
                     az_2d_lookup_deg = 90.0 - math.degrees(_angle_between(n_hat, direction))
                 pw, ph = lookup_2d(az_2d_lookup_deg)
                 # pw, ph shape: (n_f, n_pol)
+                w = float(point_weights[ip])
                 if COHERENT_SUM:
                     # Path-length phase: exp(-j*2k*r) for monostatic round trip
                     # referenced to foot point along observation direction.
+                    # Per-point amplitude weight `w` (segment length × window)
+                    # makes the sum invariant to sampling density and tapers
+                    # the aperture for sidelobe control.
                     r = float(np.dot(point_feet[ip], direction))
-                    amp = np.sqrt(np.maximum(pw, 0.0)) \
-                          * np.exp(1j * ph) \
-                          * np.exp(-1j * 2.0 * k0[:, None] * r)
+                    amp = (w * np.sqrt(np.maximum(pw, 0.0))
+                           * np.exp(1j * ph)
+                           * np.exp(-1j * 2.0 * k0[:, None] * r))
                     amp_acc += amp
                 else:
-                    pow_acc += np.maximum(pw, 0.0)
+                    # Power sum: weight squared (sum of powers), consistent
+                    # with treating `w` as an amplitude weight.
+                    pow_acc += (w * w) * np.maximum(pw, 0.0)
             if COHERENT_SUM:
                 out_power[ia, ie] = np.abs(amp_acc) ** 2
                 out_phase[ia, ie] = np.angle(amp_acc)
