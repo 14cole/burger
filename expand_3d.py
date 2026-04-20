@@ -145,6 +145,17 @@ COHERENT_SUM    = False       # False = power sum; True = amplitude sum with
 # so the weight is just 1 regardless of mode — preserves legacy behavior
 # for isolated scatterers.
 POINT_WEIGHTS   = "hann"
+
+# Optional post-hoc azimuth crop. Each entry is a (lo_deg, hi_deg) tuple;
+# output cells whose azimuth falls in any crop range are forced to the
+# SHADOW_DB_FLOOR. Ranges match modulo 360°, so (-10, 10) catches both
+# the −10° … +10° region and the 350° … 360° region (they're the same
+# direction). Empty list disables the crop.
+#
+# Typical use — masking the end-fire spikes of a 2D-line-source model:
+#     CROP_AZIMUTH_RANGES = [(-10, 10), (170, 190)]
+# Covers both ends of a line that runs along the az=0°↔180° axis.
+CROP_AZIMUTH_RANGES = []
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -1105,6 +1116,54 @@ def _expand_stl_xyz(data_2d):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional azimuth crop (post-hoc)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_azimuth_crop(az_arr, power, phase, ranges, floor_db):
+    """Zero-out (force to SHADOW_DB_FLOOR) any output cells whose azimuth
+    falls in any crop range. Ranges match modulo 360°, so (-10, 10) also
+    catches 350°..360°. Broadcasts across (el, freq, pol)."""
+    az_arr = np.asarray(az_arr, dtype=float).reshape(-1)
+    mask = np.zeros(az_arr.shape, dtype=bool)
+    for entry in ranges:
+        if not (hasattr(entry, "__len__") and len(entry) == 2):
+            raise ValueError(
+                "CROP_AZIMUTH_RANGES entries must be (lo, hi) pairs; got {!r}"
+                .format(entry)
+            )
+        lo, hi = float(entry[0]), float(entry[1])
+        if hi < lo:
+            lo, hi = hi, lo
+        center = 0.5 * (lo + hi)
+        half_width = 0.5 * (hi - lo)
+        if half_width <= 0.0:
+            continue
+        if half_width > 180.0:
+            # Range wider than half a circle — match everything.
+            mask |= True
+            continue
+        # Signed modular distance from center, wrapped to (-180, 180].
+        dist = ((az_arr - center + 180.0) % 360.0) - 180.0
+        mask |= np.abs(dist) <= half_width
+
+    if not np.any(mask):
+        print("  azimuth crop: no cells matched (ranges = {})".format(ranges), flush=True)
+        return power, phase
+
+    floor_linear = 10.0 ** (float(floor_db) / 10.0)
+    bmask = mask[:, None, None, None]                     # (n_az, 1, 1, 1)
+    power_out = power.copy()
+    phase_out = phase.copy()
+    power_out[np.broadcast_to(bmask, power.shape)] = floor_linear
+    phase_out[np.broadcast_to(bmask, phase.shape)] = np.nan
+    n_masked = int(np.sum(mask))
+    print("  azimuth crop: {} / {} azimuths forced to {:.1f} dB floor "
+          "(ranges = {})".format(n_masked, az_arr.size, float(floor_db), ranges),
+          flush=True)
+    return power_out, phase_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1148,6 +1207,13 @@ def main():
     dt = time.time() - t0
     print()
     print("  expanded to shape {}  in {:.2f} s".format(power.shape, dt))
+
+    # Optional azimuth crop, applied to the output grid before reporting
+    # and saving. Matches modulo 360° so (-10, 10) covers end-fire near 0°.
+    if CROP_AZIMUTH_RANGES:
+        power, phase = _apply_azimuth_crop(
+            az, power, phase, CROP_AZIMUTH_RANGES, SHADOW_DB_FLOOR
+        )
 
     # Reporting range (ignore non-finite).
     finite = np.isfinite(power) & (power > 0)
