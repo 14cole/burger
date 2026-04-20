@@ -92,6 +92,12 @@ SNAP_ABORT_ON_DISTANCE   = False
 # (input xyz, foot, distance, triangle idx, normal, tangent). Recommended
 # on until you're confident the geometry is wired correctly.
 SNAP_VERBOSE             = True
+# Optional 3D visualizer: opens a matplotlib window showing the STL, the
+# snapped ground points, per-point normal (red) and tangent (green) arrows,
+# a world coord triad, and the GLOBAL_AXIS. Blocking — close the window to
+# resume and run the sweep. Requires matplotlib; imported lazily, so
+# VISUALIZE = False means no dependency.
+VISUALIZE                = False
 
 CHECK_SHADOWING = True
 SHADOW_DB_FLOOR = -200.0      # dB floor applied when every point is shadowed
@@ -495,6 +501,116 @@ def _ray_hits_any_bvh(origin, direction, tris, bvh, skip_idx=-1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional 3D visualizer (matplotlib is imported lazily)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
+                     axis_vec, xyz_units, input_xyz):
+    """Show STL + ground points + per-point normal/tangent arrows + a world
+    coordinate triad + the GLOBAL_AXIS. Blocking: user closes the window
+    to resume. Lazily imports matplotlib so it stays an optional dep."""
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    except Exception as exc:
+        print("  VISUALIZE requested but matplotlib is unavailable "
+              "({}); skipping.".format(exc), flush=True)
+        return
+
+    fig = plt.figure(figsize=(11, 9))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # STL mesh as semi-transparent surface.
+    poly = Poly3DCollection(
+        tris_user, facecolor=(0.72, 0.76, 0.85, 0.28),
+        edgecolor=(0.30, 0.33, 0.42, 0.55), linewidths=0.35,
+    )
+    ax.add_collection3d(poly)
+
+    # Bounds + scale for arrows.
+    verts = tris_user.reshape(-1, 3)
+    bmin = verts.min(axis=0)
+    bmax = verts.max(axis=0)
+    span = float(np.max(bmax - bmin)) or 1.0
+    arrow_len = span * 0.10
+    triad_len = span * 0.18
+
+    # Snapped foot points (black) with index labels.
+    ax.scatter(feet_user[:, 0], feet_user[:, 1], feet_user[:, 2],
+               c="k", s=55, depthshade=False, zorder=10)
+    for i in range(feet_user.shape[0]):
+        ax.text(feet_user[i, 0], feet_user[i, 1], feet_user[i, 2],
+                " P{}".format(i), color="k", fontsize=9)
+
+        # Normal (red).
+        ax.quiver(feet_user[i, 0], feet_user[i, 1], feet_user[i, 2],
+                  normals[i, 0] * arrow_len,
+                  normals[i, 1] * arrow_len,
+                  normals[i, 2] * arrow_len,
+                  color="#cc2b2b", linewidth=1.6, arrow_length_ratio=0.22)
+
+        # Tangent (green), only when valid.
+        if tangent_valid[i]:
+            ax.quiver(feet_user[i, 0], feet_user[i, 1], feet_user[i, 2],
+                      tangents[i, 0] * arrow_len,
+                      tangents[i, 1] * arrow_len,
+                      tangents[i, 2] * arrow_len,
+                      color="#2b9b2b", linewidth=1.6, arrow_length_ratio=0.22)
+
+        # If the user's input differed from the snapped foot, show a
+        # faint connecting segment so the drift is visible.
+        inp = np.asarray(input_xyz[i], dtype=float)
+        if np.linalg.norm(inp - feet_user[i]) > 1e-6:
+            ax.plot([inp[0], feet_user[i, 0]],
+                    [inp[1], feet_user[i, 1]],
+                    [inp[2], feet_user[i, 2]],
+                    color="#888", linestyle=":", linewidth=0.9)
+            ax.scatter([inp[0]], [inp[1]], [inp[2]],
+                       c="#888", s=25, marker="x", depthshade=False)
+
+    # World triad at origin.
+    ax.quiver(0, 0, 0, triad_len, 0, 0, color="#c22", arrow_length_ratio=0.15, linewidth=1.4)
+    ax.quiver(0, 0, 0, 0, triad_len, 0, color="#1a7a1a", arrow_length_ratio=0.15, linewidth=1.4)
+    ax.quiver(0, 0, 0, 0, 0, triad_len, color="#1a3aa8", arrow_length_ratio=0.15, linewidth=1.4)
+    ax.text(triad_len * 1.08, 0, 0, "+X",        color="#c22",    fontsize=9)
+    ax.text(0, triad_len * 1.08, 0, "+Y (az 0°)", color="#1a7a1a", fontsize=9)
+    ax.text(0, 0, triad_len * 1.08, "+Z (el +90°)", color="#1a3aa8", fontsize=9)
+
+    # GLOBAL_AXIS drawn through origin as a dashed double-arrow.
+    axis_unit = axis_vec / (np.linalg.norm(axis_vec) or 1.0)
+    axis_half = axis_unit * span * 0.55
+    ax.plot([-axis_half[0], axis_half[0]],
+            [-axis_half[1], axis_half[1]],
+            [-axis_half[2], axis_half[2]],
+            color="#a238b8", linestyle="--", linewidth=1.3)
+    ax.text(axis_half[0] * 1.05, axis_half[1] * 1.05, axis_half[2] * 1.05,
+            "GLOBAL_AXIS", color="#a238b8", fontsize=9)
+
+    ax.set_xlabel("X ({})".format(xyz_units))
+    ax.set_ylabel("Y ({})".format(xyz_units))
+    ax.set_zlabel("Z ({})".format(xyz_units))
+    ax.set_title(
+        "STL + ground points    "
+        "red=normal  green=tangent(2D az=0° direction)  magenta=GLOBAL_AXIS"
+    )
+
+    # Equal aspect cube around all geometry + arrows.
+    all_pts = np.vstack([verts, feet_user, np.zeros((1, 3))])
+    ctr = 0.5 * (all_pts.min(axis=0) + all_pts.max(axis=0))
+    rad = 0.55 * float(np.max(all_pts.max(axis=0) - all_pts.min(axis=0)))
+    ax.set_xlim(ctr[0] - rad, ctr[0] + rad)
+    ax.set_ylim(ctr[1] - rad, ctr[1] + rad)
+    ax.set_zlim(ctr[2] - rad, ctr[2] + rad)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except AttributeError:
+        pass  # matplotlib < 3.3
+
+    print("  visualizer: close the window to proceed with the sweep.", flush=True)
+    plt.show()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Mode 1: finite_length
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -642,6 +758,15 @@ def _expand_stl_xyz(data_2d):
                 ),
                 flush=True,
             )
+
+    if VISUALIZE:
+        tris_user = tris / xyz_scale
+        feet_user_all = point_feet / xyz_scale
+        _visualize_setup(
+            tris_user, feet_user_all, point_normals, point_tangents,
+            point_tangent_valid, axis, XYZ_UNITS,
+            [list(p) for p in XYZ_POINTS],
+        )
 
     # Build a BVH once for the whole shadow-ray workload.
     bvh = None
