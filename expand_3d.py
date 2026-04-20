@@ -19,11 +19,16 @@ Two modes:
 2. "stl_xyz"  — distributed ground-point model on a real 3D body.
    User gives an STL file and a list of (x,y,z) ground points (inches by
    default). Each point is snapped to the nearest STL triangle; the
-   triangle's outward normal defines a local frame. For each 3D (az,el,f)
-   observation direction, each point contributes sigma_2D evaluated at
-   (90° − angle between observation direction and local normal) — i.e.
-   the 2D-solver convention where az_2d = 0° is grazing and az_2d = 90°
-   is normal incidence. Contributions are summed
+   triangle's outward normal defines the "up" axis of the point's local
+   2D frame. A user-supplied GLOBAL_AXIS (e.g. the body axis) is projected
+   into the tangent plane at each point to define the "right" axis of
+   that frame, so az_2d = 0° always means "grazing along the body axis
+   in this point's local 2D cut." The 2D lookup uses the signed in-plane
+   angle, atan2(direction·n_hat, direction·t_hat), which reproduces the
+   2D-solver convention (0° grazing right, 90° normal, 180° grazing left).
+   When the surface normal is parallel to GLOBAL_AXIS (e.g. an end cap),
+   the tangent is undefined and the lookup falls back to the rotationally
+   symmetric form (90° − angle off normal). Contributions are summed
    incoherently across points (toggle COHERENT_SUM). Per-point shadow
    testing casts a ray from the point in the observation direction against
    the STL; if blocked, that point contributes zero. If every point is
@@ -68,9 +73,25 @@ XYZ_POINTS     = [             # ground points on the body (any units)
     [0.0, 0.0, 0.0],
 ]
 XYZ_UNITS      = "inches"
+# Global body axis. Per point, the projection of this vector into the local
+# tangent plane defines the 2D "az = 0° grazing right" direction. Pick the
+# axis that matches how the 2D cross-section was cut (typically the long
+# axis of the body). End-cap points whose normal is parallel to this axis
+# fall back to the rotationally-symmetric lookup.
+GLOBAL_AXIS    = (1.0, 0.0, 0.0)
 # 3D grid (degrees). Used only in stl_xyz mode.
 AZIMUTHS_3D_STL   = list(range(0, 360, 5))
 ELEVATIONS_3D_STL = list(range(-90, 91, 5))
+
+# Snap sanity: if the nearest STL triangle is farther than this from the
+# input xyz (in XYZ_UNITS), warn — or abort if SNAP_ABORT_ON_DISTANCE is
+# True. Catches typo'd coords, wrong body, wrong units.
+SNAP_MAX_DISTANCE        = 0.25      # in XYZ_UNITS
+SNAP_ABORT_ON_DISTANCE   = False
+# Print a per-point diagnostic table after the snap + tangent-frame setup
+# (input xyz, foot, distance, triangle idx, normal, tangent). Recommended
+# on until you're confident the geometry is wired correctly.
+SNAP_VERBOSE             = True
 
 CHECK_SHADOWING = True
 SHADOW_DB_FLOOR = -200.0      # dB floor applied when every point is shadowed
@@ -329,11 +350,17 @@ def _closest_point_on_triangle(p, a, b, c):
     return a + ab * v + ac * w
 
 
-def _ray_hits_any_triangle(origin, direction, tris, skip_idx=-1):
-    """Möller–Trumbore vectorized over all triangles."""
-    v0 = tris[:, 0, :]
-    v1 = tris[:, 1, :]
-    v2 = tris[:, 2, :]
+def _mt_any_hit(origin, direction, tris_subset, orig_indices, skip_idx):
+    """Vectorized Möller–Trumbore any-hit over a subset of triangles.
+
+    `orig_indices[k]` is the original index of the k-th triangle in the
+    subset; used only to honor `skip_idx`.
+    """
+    if tris_subset.shape[0] == 0:
+        return False
+    v0 = tris_subset[:, 0, :]
+    v1 = tris_subset[:, 1, :]
+    v2 = tris_subset[:, 2, :]
     e1 = v1 - v0
     e2 = v2 - v0
     h = np.cross(direction, e2)
@@ -350,9 +377,121 @@ def _ray_hits_any_triangle(origin, direction, tris, skip_idx=-1):
     t = np.full_like(a, np.inf)
     t[ok] = np.einsum("ij,ij->i", e2[ok], q[ok]) / a[ok]
     ok &= (t > SHADOW_EPS)
-    if skip_idx >= 0 and skip_idx < ok.size:
-        ok[skip_idx] = False
+    if skip_idx >= 0:
+        ok &= (orig_indices != skip_idx)
     return bool(np.any(ok))
+
+
+def _ray_hits_any_triangle(origin, direction, tris, skip_idx=-1):
+    """Brute-force Möller–Trumbore over all triangles. Retained as a
+    correctness reference and for tiny meshes; use the BVH query for real
+    workloads."""
+    orig = np.arange(tris.shape[0], dtype=np.int64)
+    return _mt_any_hit(origin, direction, tris, orig, skip_idx)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal BVH (median-split, flat-array storage) for fast shadow queries
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Node encoding:
+#   bmin[i], bmax[i]  : (3,) AABB of node i
+#   left[i]           : >= 0 → child index (internal node)
+#                       <  0 → leaf; start = -left[i] - 1
+#   right[i]          : child index (internal) or end (leaf, exclusive)
+#   tri_indices       : (n_tri,) permutation of original triangle indices;
+#                       a leaf covers tri_indices[start:end]
+
+def _build_bvh(tris, leaf_size=8):
+    n_tri = int(tris.shape[0])
+    if n_tri == 0:
+        return None
+    centroids = tris.mean(axis=1).astype(np.float64)
+    tri_indices = np.arange(n_tri, dtype=np.int64)
+
+    nbm, nbx, nlf, nrt = [], [], [], []
+
+    def _build(start, end):
+        node_idx = len(nbm)
+        nbm.append(None); nbx.append(None); nlf.append(None); nrt.append(None)
+
+        sel = tri_indices[start:end]
+        verts = tris[sel].reshape(-1, 3)
+        bmin = verts.min(axis=0)
+        bmax = verts.max(axis=0)
+
+        if end - start <= leaf_size:
+            nbm[node_idx] = bmin
+            nbx[node_idx] = bmax
+            nlf[node_idx] = -(start + 1)
+            nrt[node_idx] = end
+            return node_idx
+
+        axis = int(np.argmax(bmax - bmin))
+        order = np.argsort(centroids[sel, axis])
+        tri_indices[start:end] = sel[order]
+        mid = start + (end - start) // 2
+
+        left = _build(start, mid)
+        right = _build(mid, end)
+
+        nbm[node_idx] = bmin
+        nbx[node_idx] = bmax
+        nlf[node_idx] = left
+        nrt[node_idx] = right
+        return node_idx
+
+    _build(0, n_tri)
+    return {
+        "bmin": np.asarray(nbm, dtype=np.float64),
+        "bmax": np.asarray(nbx, dtype=np.float64),
+        "left": np.asarray(nlf, dtype=np.int64),
+        "right": np.asarray(nrt, dtype=np.int64),
+        "tri_indices": tri_indices,
+    }
+
+
+def _ray_aabb_slabs(origin, inv_dir, bmin, bmax):
+    """Standard slabs test. Returns (tmin, tmax); no hit when tmax < max(0, tmin)."""
+    t0 = (bmin - origin) * inv_dir
+    t1 = (bmax - origin) * inv_dir
+    tlo = np.minimum(t0, t1)
+    thi = np.maximum(t0, t1)
+    return float(tlo.max()), float(thi.min())
+
+
+def _ray_hits_any_bvh(origin, direction, tris, bvh, skip_idx=-1):
+    """Iterative stack-based any-hit ray query."""
+    if bvh is None:
+        return False
+    # Guard against zero direction components.
+    dir_safe = np.where(np.abs(direction) < 1e-300, 1e-300, direction)
+    inv_dir = 1.0 / dir_safe
+
+    bmin = bvh["bmin"]
+    bmax = bvh["bmax"]
+    left = bvh["left"]
+    right = bvh["right"]
+    tri_indices = bvh["tri_indices"]
+
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        tmin, tmax = _ray_aabb_slabs(origin, inv_dir, bmin[node], bmax[node])
+        if tmax < max(0.0, tmin) or tmax < SHADOW_EPS:
+            continue
+        l = int(left[node])
+        if l < 0:
+            start = -l - 1
+            end = int(right[node])
+            orig = tri_indices[start:end]
+            if _mt_any_hit(origin, direction, tris[orig], orig, skip_idx):
+                return True
+        else:
+            # Push far-side second (popped first = visit near-side first).
+            stack.append(int(right[node]))
+            stack.append(l)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,11 +553,104 @@ def _expand_stl_xyz(data_2d):
     point_tri = np.empty(pts.shape[0], dtype=np.int64)
     point_feet = np.empty_like(pts)
     point_normals = np.empty_like(pts)
+    point_snap_dist = np.empty(pts.shape[0], dtype=np.float64)
     for pi in range(pts.shape[0]):
-        ti, foot, _ = _nearest_triangle(pts[pi], tris)
+        ti, foot, dist = _nearest_triangle(pts[pi], tris)
         point_tri[pi] = ti
         point_feet[pi] = foot
         point_normals[pi] = tri_normals[ti]
+        point_snap_dist[pi] = dist
+
+    # Snap-distance guard. Threshold is expressed in XYZ_UNITS; convert to m
+    # to compare against the internal (already-scaled) distance.
+    snap_threshold_m = _length_to_meters(float(SNAP_MAX_DISTANCE), XYZ_UNITS)
+    far_points = np.where(point_snap_dist > snap_threshold_m)[0]
+    if far_points.size > 0:
+        msg_lines = []
+        for pi in far_points:
+            dist_user = point_snap_dist[pi] / xyz_scale
+            in_xyz = np.asarray(XYZ_POINTS[pi], dtype=float)
+            msg_lines.append(
+                "    point {}: input={} {}  snap_dist={:.4g} {} "
+                "(threshold {:.4g})".format(
+                    pi, list(in_xyz), XYZ_UNITS,
+                    dist_user, XYZ_UNITS, float(SNAP_MAX_DISTANCE),
+                )
+            )
+        banner = (
+            "{} point(s) snapped farther than SNAP_MAX_DISTANCE "
+            "— check coords, units, and that STL is the correct body:"
+        ).format(far_points.size)
+        if SNAP_ABORT_ON_DISTANCE:
+            raise RuntimeError(banner + "\n" + "\n".join(msg_lines))
+        print("  WARNING: " + banner, flush=True)
+        for line in msg_lines:
+            print(line, flush=True)
+
+    # Build per-point tangent frames. The global body axis, projected into
+    # each point's tangent plane, becomes that point's 2D "az = 0° grazing
+    # right" direction. If the axis is parallel to the normal, the tangent
+    # is undefined and we flag the point for the rotationally-symmetric
+    # fallback.
+    axis = np.asarray(GLOBAL_AXIS, dtype=float)
+    axis_mag = float(np.linalg.norm(axis))
+    if axis_mag < 1e-9:
+        print("  warning: GLOBAL_AXIS is zero — defaulting to (1, 0, 0)", flush=True)
+        axis = np.array([1.0, 0.0, 0.0], dtype=float)
+    else:
+        axis = axis / axis_mag
+    point_tangents = np.zeros_like(pts)
+    point_tangent_valid = np.zeros(pts.shape[0], dtype=bool)
+    for pi in range(pts.shape[0]):
+        n_hat = point_normals[pi]
+        t_raw = axis - float(np.dot(axis, n_hat)) * n_hat
+        t_mag = float(np.linalg.norm(t_raw))
+        if t_mag > 1e-6:
+            point_tangents[pi] = t_raw / t_mag
+            point_tangent_valid[pi] = True
+        else:
+            print(
+                "  warning: point {} normal is parallel to GLOBAL_AXIS — "
+                "falling back to rotationally-symmetric lookup".format(pi),
+                flush=True,
+            )
+
+    if SNAP_VERBOSE:
+        print("  per-point snap diagnostic (distances in {}):".format(XYZ_UNITS), flush=True)
+        print(
+            "    {:>3}  {:>20}  {:>20}  {:>9}  {:>6}  {:>20}  {:>20}  {:>5}".format(
+                "#", "input", "foot", "dist", "tri", "normal", "tangent", "t_ok"
+            ),
+            flush=True,
+        )
+        for pi in range(pts.shape[0]):
+            inp = np.asarray(XYZ_POINTS[pi], dtype=float)
+            foot_user = point_feet[pi] / xyz_scale
+            dist_user = point_snap_dist[pi] / xyz_scale
+            nvec = point_normals[pi]
+            tvec = point_tangents[pi]
+            print(
+                "    {:>3d}  ({: .3f},{: .3f},{: .3f})  "
+                "({: .3f},{: .3f},{: .3f})  {:>9.4g}  {:>6d}  "
+                "({: .3f},{: .3f},{: .3f})  ({: .3f},{: .3f},{: .3f})  {:>5}".format(
+                    pi, inp[0], inp[1], inp[2],
+                    foot_user[0], foot_user[1], foot_user[2],
+                    dist_user, int(point_tri[pi]),
+                    nvec[0], nvec[1], nvec[2],
+                    tvec[0], tvec[1], tvec[2],
+                    "yes" if point_tangent_valid[pi] else "NO",
+                ),
+                flush=True,
+            )
+
+    # Build a BVH once for the whole shadow-ray workload.
+    bvh = None
+    if CHECK_SHADOWING:
+        t_bvh = time.time()
+        bvh = _build_bvh(tris, leaf_size=8)
+        print("  BVH: {} nodes for {} tris  ({:.2f}s)".format(
+            0 if bvh is None else bvh["bmin"].shape[0],
+            tris.shape[0], time.time() - t_bvh), flush=True)
 
     azimuths_3d = np.asarray(AZIMUTHS_3D_STL, dtype=float)
     elevations_3d = np.asarray(ELEVATIONS_3D_STL, dtype=float)
@@ -490,14 +722,23 @@ def _expand_stl_xyz(data_2d):
                     continue
                 if CHECK_SHADOWING:
                     origin = point_feet[ip] + RAY_OFFSET * n_hat
-                    if _ray_hits_any_triangle(origin, direction, tris,
-                                              skip_idx=int(point_tri[ip])):
+                    if _ray_hits_any_bvh(origin, direction, tris, bvh,
+                                         skip_idx=int(point_tri[ip])):
                         continue
                 lit_any = True
-                # 2D axis convention: az_2d = 0° grazing, 90° normal.
-                # angle_between returns 0° when direction aligns with normal,
-                # so flip to match the 2D solver's labeling.
-                az_2d_lookup_deg = 90.0 - math.degrees(_angle_between(n_hat, direction))
+                # 2D axis convention: az_2d = 0° grazing right (along the
+                # global body axis projected into this point's tangent plane),
+                # 90° normal, 180° grazing left. Use the signed in-plane
+                # angle so asymmetric 2D cuts map correctly. On points whose
+                # normal is parallel to GLOBAL_AXIS, fall back to the
+                # rotationally-symmetric form.
+                if point_tangent_valid[ip]:
+                    t_hat = point_tangents[ip]
+                    dn = float(np.dot(n_hat, direction))
+                    dt = float(np.dot(t_hat, direction))
+                    az_2d_lookup_deg = math.degrees(math.atan2(dn, dt))
+                else:
+                    az_2d_lookup_deg = 90.0 - math.degrees(_angle_between(n_hat, direction))
                 pw, ph = lookup_2d(az_2d_lookup_deg)
                 # pw, ph shape: (n_f, n_pol)
                 if COHERENT_SUM:
