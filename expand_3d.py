@@ -146,16 +146,29 @@ COHERENT_SUM    = False       # False = power sum; True = amplitude sum with
 # for isolated scatterers.
 POINT_WEIGHTS   = "hann"
 
-# Optional post-hoc azimuth crop. Each entry is a (lo_deg, hi_deg) tuple;
-# output cells whose azimuth falls in any crop range are forced to the
-# SHADOW_DB_FLOOR. Ranges match modulo 360°, so (-10, 10) catches both
-# the −10° … +10° region and the 350° … 360° region (they're the same
-# direction). Empty list disables the crop.
+# Optional azimuth crops. Two independent knobs, both off by default.
 #
-# Typical use — masking the end-fire spikes of a 2D-line-source model:
-#     CROP_AZIMUTH_RANGES = [(-10, 10), (170, 190)]
-# Covers both ends of a line that runs along the az=0°↔180° axis.
-CROP_AZIMUTH_RANGES = []
+# CROP_2D_AZIMUTH_RANGES  — applied to the input .grim before expansion.
+#   Any input 2D az in the listed ranges gets its rcs_power floored and
+#   rcs_phase NaN'd. The 2D axis is whatever convention your solver used
+#   (az=0° grazing right, az=90° normal, etc.). Cropping a range here
+#   *removes that data from the 2D lookup altogether* — every 3D direction
+#   that would have mapped to that 2D az now reads the floor. Useful when
+#   you know certain 2D azimuths are unphysical (numerical noise at
+#   grazing) or when you want to mask out the 2D normal-incidence peak
+#   to kill everything driven by it downstream.
+#
+# CROP_3D_AZIMUTH_RANGES  — applied post-hoc to the output grid.
+#   Any 3D az in the listed ranges gets floored in the output. This is
+#   a direct mask on the output directions you see, independent of what
+#   the lookup does internally. Useful for hiding known-unphysical
+#   directions (end-fire spikes from the 2D-line-source model) without
+#   touching the 2D data.
+#
+# Both accept (lo_deg, hi_deg) tuples and match modulo 360°, so (-10, 10)
+# also catches 350° … 360° (same direction). Empty list disables.
+CROP_2D_AZIMUTH_RANGES = []
+CROP_3D_AZIMUTH_RANGES = []
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -1119,17 +1132,16 @@ def _expand_stl_xyz(data_2d):
 # Optional azimuth crop (post-hoc)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_azimuth_crop(az_arr, power, phase, ranges, floor_db):
-    """Zero-out (force to SHADOW_DB_FLOOR) any output cells whose azimuth
-    falls in any crop range. Ranges match modulo 360°, so (-10, 10) also
-    catches 350°..360°. Broadcasts across (el, freq, pol)."""
+def _mask_azimuths_in_ranges(az_arr, ranges, label_for_errors):
+    """Build a boolean mask over az_arr for entries falling in any of the
+    (lo, hi) ranges, modulo 360°. Shared by 2D-input and 3D-output crops."""
     az_arr = np.asarray(az_arr, dtype=float).reshape(-1)
     mask = np.zeros(az_arr.shape, dtype=bool)
     for entry in ranges:
         if not (hasattr(entry, "__len__") and len(entry) == 2):
             raise ValueError(
-                "CROP_AZIMUTH_RANGES entries must be (lo, hi) pairs; got {!r}"
-                .format(entry)
+                "{} entries must be (lo, hi) pairs; got {!r}"
+                .format(label_for_errors, entry)
             )
         lo, hi = float(entry[0]), float(entry[1])
         if hi < lo:
@@ -1139,25 +1151,58 @@ def _apply_azimuth_crop(az_arr, power, phase, ranges, floor_db):
         if half_width <= 0.0:
             continue
         if half_width > 180.0:
-            # Range wider than half a circle — match everything.
             mask |= True
             continue
-        # Signed modular distance from center, wrapped to (-180, 180].
         dist = ((az_arr - center + 180.0) % 360.0) - 180.0
         mask |= np.abs(dist) <= half_width
+    return mask
 
+
+def _apply_2d_azimuth_crop(data_2d, ranges, floor_db):
+    """Zero-out input 2D cells by their 2D azimuth. Modifies a copy of
+    data_2d (original left intact)."""
+    az_2d = np.asarray(data_2d["azimuths"], dtype=float)
+    mask = _mask_azimuths_in_ranges(az_2d, ranges, "CROP_2D_AZIMUTH_RANGES")
     if not np.any(mask):
-        print("  azimuth crop: no cells matched (ranges = {})".format(ranges), flush=True)
+        print("  2D-input crop: no 2D azimuths matched (ranges = {})".format(ranges),
+              flush=True)
+        return data_2d
+
+    floor_linear = 10.0 ** (float(floor_db) / 10.0)
+    out = dict(data_2d)
+    power = np.array(data_2d["rcs_power"], copy=True)
+    phase = np.array(data_2d["rcs_phase"], copy=True)
+    # 2D array shape is (n_az_2d, n_el_2d=1, n_f, n_pol); mask along az axis.
+    bmask = mask[:, None, None, None]
+    power[np.broadcast_to(bmask, power.shape)] = floor_linear
+    phase[np.broadcast_to(bmask, phase.shape)] = np.nan
+    out["rcs_power"] = power
+    out["rcs_phase"] = phase
+    n_masked = int(np.sum(mask))
+    print("  2D-input crop: {} / {} 2D azimuths forced to {:.1f} dB floor "
+          "(ranges = {})".format(n_masked, az_2d.size, float(floor_db), ranges),
+          flush=True)
+    return out
+
+
+def _apply_azimuth_crop(az_arr, power, phase, ranges, floor_db):
+    """Zero-out 3D output cells by their 3D azimuth. Broadcasts the mask
+    across (el, freq, pol)."""
+    az_arr = np.asarray(az_arr, dtype=float).reshape(-1)
+    mask = _mask_azimuths_in_ranges(az_arr, ranges, "CROP_3D_AZIMUTH_RANGES")
+    if not np.any(mask):
+        print("  3D-output crop: no 3D azimuths matched (ranges = {})".format(ranges),
+              flush=True)
         return power, phase
 
     floor_linear = 10.0 ** (float(floor_db) / 10.0)
-    bmask = mask[:, None, None, None]                     # (n_az, 1, 1, 1)
+    bmask = mask[:, None, None, None]
     power_out = power.copy()
     phase_out = phase.copy()
     power_out[np.broadcast_to(bmask, power.shape)] = floor_linear
     phase_out[np.broadcast_to(bmask, phase.shape)] = np.nan
     n_masked = int(np.sum(mask))
-    print("  azimuth crop: {} / {} azimuths forced to {:.1f} dB floor "
+    print("  3D-output crop: {} / {} 3D azimuths forced to {:.1f} dB floor "
           "(ranges = {})".format(n_masked, az_arr.size, float(floor_db), ranges),
           flush=True)
     return power_out, phase_out
@@ -1184,6 +1229,14 @@ def main():
         data_2d["frequencies"].size,
         float(data_2d["frequencies"].min()), float(data_2d["frequencies"].max())))
     print("  pol      : {}".format(", ".join(str(p) for p in data_2d["polarizations"])))
+
+    # Optional 2D-input crop, applied *before* expansion. Every 3D direction
+    # whose local 2D lookup would have landed in one of these ranges will
+    # now read the shadow floor.
+    if CROP_2D_AZIMUTH_RANGES:
+        data_2d = _apply_2d_azimuth_crop(
+            data_2d, CROP_2D_AZIMUTH_RANGES, SHADOW_DB_FLOOR
+        )
     print()
 
     t0 = time.time()
@@ -1208,11 +1261,11 @@ def main():
     print()
     print("  expanded to shape {}  in {:.2f} s".format(power.shape, dt))
 
-    # Optional azimuth crop, applied to the output grid before reporting
-    # and saving. Matches modulo 360° so (-10, 10) covers end-fire near 0°.
-    if CROP_AZIMUTH_RANGES:
+    # Optional 3D-output crop, applied to the expanded grid before
+    # reporting and saving.
+    if CROP_3D_AZIMUTH_RANGES:
         power, phase = _apply_azimuth_crop(
-            az, power, phase, CROP_AZIMUTH_RANGES, SHADOW_DB_FLOOR
+            az, power, phase, CROP_3D_AZIMUTH_RANGES, SHADOW_DB_FLOOR
         )
 
     # Reporting range (ignore non-finite).
