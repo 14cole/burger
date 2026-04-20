@@ -78,6 +78,12 @@ AZIMUTHS_3D    = list(range(0, 360, 5))
 # ----- Mode 2: stl_xyz ---------------------------------------------------------
 STL_PATH       = "body.stl"
 STL_UNITS      = "inches"     # "inches" or "meters"
+# Set True when the STL has globally reversed vertex winding, so every
+# computed normal comes out pointing *into* the body. Negates all normals
+# on load. Does NOT fix mixed-winding STLs (some CCW, some CW) — for
+# those, repair the mesh (MeshLab "Re-Orient faces coherently" / Blender
+# "Recalculate Outside").
+NORMALS_FLIP   = False
 XYZ_POINTS     = [             # ground points on the body (any units)
     [0.0, 0.0, 0.0],
 ]
@@ -726,6 +732,9 @@ def _expand_stl_xyz(data_2d):
     phase_2d = np.squeeze(data_2d["rcs_phase"], axis=1)
 
     tris_raw, tri_normals = _read_stl(STL_PATH)
+    if NORMALS_FLIP:
+        tri_normals = -tri_normals
+        print("  NORMALS_FLIP = True: inverted every STL normal on load", flush=True)
     stl_scale = _length_to_meters(1.0, STL_UNITS)
     xyz_scale = _length_to_meters(1.0, XYZ_UNITS)
     tris = tris_raw * stl_scale
