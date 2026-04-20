@@ -19,16 +19,25 @@ Two modes:
 2. "stl_xyz"  — distributed ground-point model on a real 3D body.
    User gives an STL file and a list of (x,y,z) ground points (inches by
    default). Each point is snapped to the nearest STL triangle; the
-   triangle's outward normal defines the "up" axis of the point's local
-   2D frame. A user-supplied GLOBAL_AXIS (e.g. the body axis) is projected
-   into the tangent plane at each point to define the "right" axis of
-   that frame, so az_2d = 0° always means "grazing along the body axis
-   in this point's local 2D cut." The 2D lookup uses the signed in-plane
-   angle, atan2(direction·n_hat, direction·t_hat), which reproduces the
-   2D-solver convention (0° grazing right, 90° normal, 180° grazing left).
-   When the surface normal is parallel to GLOBAL_AXIS (e.g. an end cap),
-   the tangent is undefined and the lookup falls back to the rotationally
-   symmetric form (90° − angle off normal). Contributions are summed
+   triangle's outward normal is "up" (2D az=90°) in the point's local
+   frame. The 2D az=0° (grazing right) direction is determined by the
+   TANGENT_MODE setting:
+     "inferred_line" — the points are treated as an ordered path along a
+       feature (a gap, seam, edge). At each point the line tangent is
+       computed from neighbor differences; the 2D az=0° direction is
+       `line_tangent × n_hat` (right-hand rule). Intuition: walking along
+       the line with the normal pointing up, your right is the az=0°
+       grazing direction; the 2D plane is perpendicular to the line.
+     "global_axis" — a user-supplied world-space axis, projected into
+       each point's tangent plane, becomes the 2D az=0° direction; the
+       2D plane contains that axis. Use for BOR-like bodies where the
+       2D solve is a radial cross-section through the body axis.
+   The lookup is `atan2(direction·n_hat, direction·t_hat)`, which
+   reproduces the 2D-solver convention (0° grazing right, 90° normal,
+   180° grazing left). Points where the tangent is undefined (isolated
+   point; line parallel to normal; axis parallel to normal) fall back
+   to the rotationally-symmetric form (90° − angle off normal).
+   Contributions are summed
    incoherently across points (toggle COHERENT_SUM). Per-point shadow
    testing casts a ray from the point in the observation direction against
    the STL; if blocked, that point contributes zero. If every point is
@@ -73,12 +82,21 @@ XYZ_POINTS     = [             # ground points on the body (any units)
     [0.0, 0.0, 0.0],
 ]
 XYZ_UNITS      = "inches"
-# Global body axis. Per point, the projection of this vector into the local
-# tangent plane defines the 2D "az = 0° grazing right" direction. Pick the
-# axis that matches how the 2D cross-section was cut (typically the long
-# axis of the body). End-cap points whose normal is parallel to this axis
-# fall back to the rotationally-symmetric lookup.
-GLOBAL_AXIS    = (1.0, 0.0, 0.0)
+# How each point's 2D "az = 0° grazing right" direction is determined.
+#   "inferred_line" — infer from the ordering of XYZ_POINTS. The points
+#       are treated as an ordered path along a feature (a gap, a seam, an
+#       edge). At each point the line tangent is computed from neighbor
+#       differences; the 2D az=0° direction in 3D is `line_tangent × n_hat`
+#       (right-hand rule: "facing along the line with the normal up, your
+#       right is the 2D az=0° grazing direction"). Points whose line
+#       tangent is parallel to the normal, and isolated points with no
+#       neighbors, fall back to the rotationally-symmetric lookup.
+#   "global_axis" — fixed world-space axis projected into each point's
+#       tangent plane becomes the 2D az=0° direction. Used for non-line
+#       arrangements on a body of revolution where the 2D solve's plane
+#       contains the body axis.
+TANGENT_MODE   = "inferred_line"
+GLOBAL_AXIS    = (1.0, 0.0, 0.0)   # used when TANGENT_MODE = "global_axis"
 # 3D grid (degrees). Used only in stl_xyz mode.
 AZIMUTHS_3D_STL   = list(range(0, 360, 5))
 ELEVATIONS_3D_STL = list(range(-90, 91, 5))
@@ -213,6 +231,31 @@ def _angle_between(v1, v2):
     c = float(np.dot(v1, v2))
     c = max(-1.0, min(1.0, c))
     return math.acos(c)
+
+
+def _infer_line_tangents(pts):
+    """Return per-point unit tangent inferred from neighbor differences.
+
+    Central differences for interior points, one-sided at the endpoints.
+    Returns a zero vector for any point whose neighbor difference is
+    (effectively) zero or when the input has fewer than two points.
+    Callers should check `np.linalg.norm(tan) > 0` before using each row.
+    """
+    n = int(pts.shape[0])
+    tans = np.zeros_like(pts, dtype=float)
+    if n < 2:
+        return tans
+    for i in range(n):
+        if i == 0:
+            d = pts[1] - pts[0]
+        elif i == n - 1:
+            d = pts[n - 1] - pts[n - 2]
+        else:
+            d = pts[i + 1] - pts[i - 1]
+        m = float(np.linalg.norm(d))
+        if m > 1e-12:
+            tans[i] = d / m
+    return tans
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,10 +548,14 @@ def _ray_hits_any_bvh(origin, direction, tris, bvh, skip_idx=-1):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
-                     axis_vec, xyz_units, input_xyz):
+                     axis_vec, xyz_units, input_xyz,
+                     line_tangents=None, tangent_mode="inferred_line"):
     """Show STL + ground points + per-point normal/tangent arrows + a world
-    coordinate triad + the GLOBAL_AXIS. Blocking: user closes the window
-    to resume. Lazily imports matplotlib so it stays an optional dep."""
+    coordinate triad. In "inferred_line" mode it also draws the inferred
+    path as a cyan polyline with a forward-tangent arrow per point. In
+    "global_axis" mode it draws the GLOBAL_AXIS as a magenta dashed line
+    through the origin. Blocking: user closes the window to resume.
+    Lazily imports matplotlib so it stays an optional dep."""
     try:
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -576,22 +623,41 @@ def _visualize_setup(tris_user, feet_user, normals, tangents, tangent_valid,
     ax.text(0, triad_len * 1.08, 0, "+Y (az 0°)", color="#1a7a1a", fontsize=9)
     ax.text(0, 0, triad_len * 1.08, "+Z (el +90°)", color="#1a3aa8", fontsize=9)
 
-    # GLOBAL_AXIS drawn through origin as a dashed double-arrow.
-    axis_unit = axis_vec / (np.linalg.norm(axis_vec) or 1.0)
-    axis_half = axis_unit * span * 0.55
-    ax.plot([-axis_half[0], axis_half[0]],
-            [-axis_half[1], axis_half[1]],
-            [-axis_half[2], axis_half[2]],
-            color="#a238b8", linestyle="--", linewidth=1.3)
-    ax.text(axis_half[0] * 1.05, axis_half[1] * 1.05, axis_half[2] * 1.05,
-            "GLOBAL_AXIS", color="#a238b8", fontsize=9)
+    # Tangent-source overlay.
+    if tangent_mode == "inferred_line" and line_tangents is not None \
+            and feet_user.shape[0] >= 2:
+        # Path polyline connecting the ordered points.
+        ax.plot(feet_user[:, 0], feet_user[:, 1], feet_user[:, 2],
+                color="#1cbec2", linewidth=1.2, alpha=0.8)
+        # Forward-tangent arrow at each point (cyan).
+        for i in range(feet_user.shape[0]):
+            lt = line_tangents[i] if i < line_tangents.shape[0] else None
+            if lt is None or float(np.linalg.norm(lt)) < 1e-9:
+                continue
+            ax.quiver(feet_user[i, 0], feet_user[i, 1], feet_user[i, 2],
+                      lt[0] * arrow_len * 0.8,
+                      lt[1] * arrow_len * 0.8,
+                      lt[2] * arrow_len * 0.8,
+                      color="#1cbec2", linewidth=1.2,
+                      arrow_length_ratio=0.25)
+    elif tangent_mode == "global_axis":
+        axis_unit = axis_vec / (np.linalg.norm(axis_vec) or 1.0)
+        axis_half = axis_unit * span * 0.55
+        ax.plot([-axis_half[0], axis_half[0]],
+                [-axis_half[1], axis_half[1]],
+                [-axis_half[2], axis_half[2]],
+                color="#a238b8", linestyle="--", linewidth=1.3)
+        ax.text(axis_half[0] * 1.05, axis_half[1] * 1.05, axis_half[2] * 1.05,
+                "GLOBAL_AXIS", color="#a238b8", fontsize=9)
 
     ax.set_xlabel("X ({})".format(xyz_units))
     ax.set_ylabel("Y ({})".format(xyz_units))
     ax.set_zlabel("Z ({})".format(xyz_units))
+    overlay = ("cyan=line_tangent (path)" if tangent_mode == "inferred_line"
+               else "magenta=GLOBAL_AXIS")
     ax.set_title(
         "STL + ground points    "
-        "red=normal  green=tangent(2D az=0° direction)  magenta=GLOBAL_AXIS"
+        "red=normal  green=2D az=0° direction  {}".format(overlay)
     )
 
     # Equal aspect cube around all geometry + arrows.
@@ -703,33 +769,64 @@ def _expand_stl_xyz(data_2d):
         for line in msg_lines:
             print(line, flush=True)
 
-    # Build per-point tangent frames. The global body axis, projected into
-    # each point's tangent plane, becomes that point's 2D "az = 0° grazing
-    # right" direction. If the axis is parallel to the normal, the tangent
-    # is undefined and we flag the point for the rotationally-symmetric
-    # fallback.
-    axis = np.asarray(GLOBAL_AXIS, dtype=float)
-    axis_mag = float(np.linalg.norm(axis))
-    if axis_mag < 1e-9:
-        print("  warning: GLOBAL_AXIS is zero — defaulting to (1, 0, 0)", flush=True)
-        axis = np.array([1.0, 0.0, 0.0], dtype=float)
-    else:
-        axis = axis / axis_mag
+    # Build per-point 2D frames. `point_tangents[pi]` is the 3D unit
+    # vector pointing in the 2D az=0° (grazing right) direction at point
+    # `pi`. Source depends on TANGENT_MODE.
     point_tangents = np.zeros_like(pts)
     point_tangent_valid = np.zeros(pts.shape[0], dtype=bool)
-    for pi in range(pts.shape[0]):
-        n_hat = point_normals[pi]
-        t_raw = axis - float(np.dot(axis, n_hat)) * n_hat
-        t_mag = float(np.linalg.norm(t_raw))
-        if t_mag > 1e-6:
-            point_tangents[pi] = t_raw / t_mag
+    # Will be populated in the mode-specific branch; used by the visualizer
+    # when TANGENT_MODE = "inferred_line" so the user can see the path.
+    line_tangents_raw = np.zeros_like(pts)
+
+    mode_str = str(TANGENT_MODE).strip().lower()
+    if mode_str == "inferred_line":
+        line_tangents_raw = _infer_line_tangents(pts)
+        for pi in range(pts.shape[0]):
+            n_hat = point_normals[pi]
+            lt = line_tangents_raw[pi]
+            if float(np.linalg.norm(lt)) < 1e-9:
+                print(
+                    "  warning: point {} has no inferable line tangent "
+                    "(isolated or duplicate neighbor) — falling back to "
+                    "rotationally-symmetric lookup".format(pi),
+                    flush=True,
+                )
+                continue
+            right = np.cross(lt, n_hat)
+            r_mag = float(np.linalg.norm(right))
+            if r_mag < 1e-6:
+                print(
+                    "  warning: point {} line tangent is parallel to the "
+                    "surface normal — falling back to rotationally-symmetric "
+                    "lookup".format(pi),
+                    flush=True,
+                )
+                continue
+            point_tangents[pi] = right / r_mag
             point_tangent_valid[pi] = True
+    elif mode_str == "global_axis":
+        axis = np.asarray(GLOBAL_AXIS, dtype=float)
+        axis_mag = float(np.linalg.norm(axis))
+        if axis_mag < 1e-9:
+            print("  warning: GLOBAL_AXIS is zero — defaulting to (1, 0, 0)", flush=True)
+            axis = np.array([1.0, 0.0, 0.0], dtype=float)
         else:
-            print(
-                "  warning: point {} normal is parallel to GLOBAL_AXIS — "
-                "falling back to rotationally-symmetric lookup".format(pi),
-                flush=True,
-            )
+            axis = axis / axis_mag
+        for pi in range(pts.shape[0]):
+            n_hat = point_normals[pi]
+            t_raw = axis - float(np.dot(axis, n_hat)) * n_hat
+            t_mag = float(np.linalg.norm(t_raw))
+            if t_mag > 1e-6:
+                point_tangents[pi] = t_raw / t_mag
+                point_tangent_valid[pi] = True
+            else:
+                print(
+                    "  warning: point {} normal is parallel to GLOBAL_AXIS — "
+                    "falling back to rotationally-symmetric lookup".format(pi),
+                    flush=True,
+                )
+    else:
+        raise ValueError("TANGENT_MODE must be 'inferred_line' or 'global_axis', got {!r}".format(TANGENT_MODE))
 
     if SNAP_VERBOSE:
         print("  per-point snap diagnostic (distances in {}):".format(XYZ_UNITS), flush=True)
@@ -762,10 +859,15 @@ def _expand_stl_xyz(data_2d):
     if VISUALIZE:
         tris_user = tris / xyz_scale
         feet_user_all = point_feet / xyz_scale
+        axis_for_viz = np.asarray(GLOBAL_AXIS, dtype=float)
+        if float(np.linalg.norm(axis_for_viz)) < 1e-9:
+            axis_for_viz = np.array([1.0, 0.0, 0.0], dtype=float)
         _visualize_setup(
             tris_user, feet_user_all, point_normals, point_tangents,
-            point_tangent_valid, axis, XYZ_UNITS,
+            point_tangent_valid, axis_for_viz, XYZ_UNITS,
             [list(p) for p in XYZ_POINTS],
+            line_tangents=line_tangents_raw,
+            tangent_mode=mode_str,
         )
 
     # Build a BVH once for the whole shadow-ray workload.
